@@ -20,6 +20,7 @@ add_executable(request_sim
     src/DatasetLoader.cpp
     src/TrafficEngine.cpp
     src/RequestSimulator.cpp
+    src/SimConfig.cpp
 )
 
 target_include_directories(request_sim PRIVATE include)

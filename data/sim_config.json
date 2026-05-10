@@ -1,0 +1,37 @@
+{
+  "label": "default-synth",
+
+  "hardware": {
+    "stream_queue_capacity": 2048,
+    "history_window":        128,
+    "feedback_retention":    65536
+  },
+
+  "workload": {
+    "mode":             "synthetic",
+    "trace_path":       "data/sample_trace.csv",
+    "max_requests":     50000,
+    "real_time_pacing": false,
+
+    "synthetic": {
+      "catalog_size":   5000,
+      "zipf_alpha":     0.80,
+      "num_users":      50,
+      "mean_iat_ns":    250000,
+      "mean_file_size": 1048576,
+      "seed":           13369344
+    }
+  },
+
+  "consumer": {
+    "batch_size":          128,
+    "emit_feedback":       true,
+    "feedback_period_us":  50
+  },
+
+  "ui": {
+    "live_dashboard": true,
+    "refresh_ms":     100,
+    "run_seconds":    2
+  }
+}

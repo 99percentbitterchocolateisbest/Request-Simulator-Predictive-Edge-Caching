@@ -1,0 +1,35 @@
+{
+  "label": "fat-hw",
+
+  "hardware": {
+    "stream_queue_capacity": 65536,
+    "history_window":        2048,
+    "feedback_retention":    1048576
+  },
+
+  "workload": {
+    "mode":             "synthetic",
+    "max_requests":     500000,
+    "real_time_pacing": false,
+
+    "synthetic": {
+      "catalog_size":   100000,
+      "zipf_alpha":     0.80,
+      "num_users":      500,
+      "mean_iat_ns":    100000,
+      "seed":           42
+    }
+  },
+
+  "consumer": {
+    "batch_size":          512,
+    "emit_feedback":       true,
+    "feedback_period_us":  10
+  },
+
+  "ui": {
+    "live_dashboard": true,
+    "refresh_ms":     200,
+    "run_seconds":    3
+  }
+}

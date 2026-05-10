@@ -8,21 +8,20 @@ the Edge Cache Controller.
 
 ## Architecture mapping
 
-| Box in diagram        | Code artifact                                         |
-| --------------------- | ----------------------------------------------------- |
-| User Equipment        | (external; modeled inside `TrafficEngine`)            |
-| Dataset Loader        | `DatasetLoader` interface, `CsvTraceLoader` impl      |
+| Box in diagram        | Code                                                                       |
+| --------------------- | -------------------------------------------------------------------------- |
+| User Equipment        | (external; modeled inside `TrafficEngine`)                                 |
+| Dataset Loader        | `DatasetLoader` interface, `CsvTraceLoader` impl                           |
 | Traffic Engine        | `TrafficEngine` interface, `TraceReplayEngine` and `SyntheticEngine` impls |
-| I/O Optimizer         | `BoundedQueue<Request>` + `HistoryBuffer`             |
-| `request_stream` out  | `RequestSimulator::pop_request_stream()`              |
-| `history` out         | `RequestSimulator::get_history()`                     |
-| feedback loop in      | `RequestSimulator::submit_feedback()`                 |
+| I/O Optimizer         | `BoundedQueue<Request>` + `HistoryBuffer`                                  |
+| `request_stream` out  | `RequestSimulator::pop_request_stream()`                                   |
+| `history` out         | `RequestSimulator::get_history()`                                          |
+| feedback loop in      | `RequestSimulator::submit_feedback()`                                      |
 
-## Key design choices 
+## Key design choices
 
 | Choice                                      | Reason / citation                                                                                         |
 |---------------------------------------------|-----------------------------------------------------------------------------------------------------------|
-|                                             |                                                                                                           |
 | `Request` is a trivially-copyable POD       | Stroustrup, *The C++ Programming Language* 4e §8.2.6 — POD types compose with lock-free queues and memcpy |
 | `Feedback` lives outside `Request`          | keeps `Request` POD; closes the diagram's feedback loop without a circular dep                            |
 | Strategy pattern for `TrafficEngine`        | Open/Closed Principle — Meyer, *OO Software Construction* (1988)                                          |
@@ -40,6 +39,38 @@ the Edge Cache Controller.
 | Simulation time, not wall-clock             | Banks, Carson, Nelson, Nicol, *Discrete-Event System Simulation* 5e (2010) §1.2                           |
 | Bounded feedback retention                  | prevents unbounded RSS growth on long simulations — engineering necessity, not from the literature        |
 | Two-phase shutdown (set flag, close, join)  | found by running it: thread destructors that run while joinable call `std::terminate`                     |
+| Hand-rolled JSON parser, no nlohmann/RapidJSON | preserves the stdlib + pthreads dependency surface; ~250 lines is cheaper than vendoring a header       |
+| `std::variant` for `JsonValue`              | C++17 sum-type idiom; safer than tagged-union by hand                                                     |
+| Single `if constexpr` template for `get_or<T>` | on x86_64 Linux `size_t` ≡ `uint64_t`; explicit specializations would collide                           |
+| Resolved config printed at startup          | misspelled keys silently fall through to defaults; printing makes that visible without a separate validator |
+| ANSI escapes, no ncurses/termbox            | every modern terminal supports CSI; zero new build deps                                                   |
+| Render-then-cursor-up frame strategy        | technique used in `top` / `htop`; avoids `\033[2J` flicker on slow terminals                              |
+| 1-second sliding throughput window with cumulative fallback | windowed rate is more diagnostic than cumulative; fallback prevents 0 req/s on sub-second runs |
+| Consumer-side counters live outside `RequestSimulator` | the simulator's contract (the diagram) doesn't include the predictor — its counters belong to its owner |
+
+## Configuration
+
+Hardware and workload knobs are loaded from a JSON file at startup so a
+config sweep is a directory of files, not a recompile. Defaults match
+the prior hard-coded values exactly, so the JSON path is purely
+additive — missing files or missing keys behave identically to the old
+demo.
+
+| Section              | Keys                                                                                            | Maps to                       |
+|----------------------|-------------------------------------------------------------------------------------------------|-------------------------------|
+| `hardware`           | `stream_queue_capacity`, `history_window`, `feedback_retention`                                 | `SimulatorConfig`             |
+| `workload`           | `mode` (`synthetic`\|`trace`), `trace_path`, `max_requests`, `real_time_pacing`                 | `SimulatorConfig` + engine    |
+| `workload.synthetic` | `catalog_size`, `zipf_alpha`, `num_users`, `mean_iat_ns`, `mean_file_size`, `seed`              | `SyntheticConfig`             |
+| `consumer`           | `batch_size`, `emit_feedback`, `feedback_period_us`                                             | mock ML / cache controller    |
+| `ui`                 | `live_dashboard`, `refresh_ms`, `run_seconds`                                                   | `LiveDashboard` + run cap     |
+
+Three sample configs ship in `data/`:
+
+| File                       | Hardware                                | Use                                  |
+|----------------------------|-----------------------------------------|--------------------------------------|
+| `sim_config.json`          | queue=2048, history=128                 | default demo                         |
+| `sim_config_tiny.json`     | queue=32, history=16, batch=4           | exercises backpressure / saturation  |
+| `sim_config_fat.json`      | queue=64k, history=2048, batch=512      | high-throughput run (~1.16 Mreq/s)   |
 
 ## Build & run
 
@@ -47,8 +78,10 @@ the Edge Cache Controller.
 # CMake (preferred)
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-./build/request_sim                            # synthetic mode
-./build/request_sim trace data/sample_trace.csv # replay mode
+
+./build/request_sim                              # default config: data/sim_config.json
+./build/request_sim data/sim_config_fat.json     # explicit config
+./build/request_sim trace data/sample_trace.csv  # legacy CLI: trace replay shorthand
 
 # Or directly with g++ (C++17, pthreads)
 g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Wshadow \
@@ -78,12 +111,19 @@ include/
   TrafficEngine.hpp       Strategy interface + TraceReplay + Synthetic
   IOOptimizer.hpp         BoundedQueue + HistoryBuffer
   RequestSimulator.hpp    top-level orchestrator
+  Json.hpp                minimal recursive-descent JSON parser
+  SimConfig.hpp           typed config struct + JSON loader
+  LiveDashboard.hpp       ANSI-based live terminal UI
 src/
   DatasetLoader.cpp
   TrafficEngine.cpp
   RequestSimulator.cpp
+  SimConfig.cpp
   main.cpp                end-to-end demo with mock predictor + cache ctrl
 data/
   sample_trace.csv
+  sim_config.json         default (queue=2048, history=128)
+  sim_config_tiny.json    constrained hardware (queue=32, history=16)
+  sim_config_fat.json     generous hardware (queue=64k, history=2048)
 CMakeLists.txt
 ```

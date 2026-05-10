@@ -1,0 +1,35 @@
+{
+  "label": "tiny-hw",
+
+  "hardware": {
+    "stream_queue_capacity": 32,
+    "history_window":        16,
+    "feedback_retention":    1024
+  },
+
+  "workload": {
+    "mode":             "synthetic",
+    "max_requests":     20000,
+    "real_time_pacing": false,
+
+    "synthetic": {
+      "catalog_size":   1000,
+      "zipf_alpha":     0.80,
+      "num_users":      10,
+      "mean_iat_ns":    250000,
+      "seed":           1
+    }
+  },
+
+  "consumer": {
+    "batch_size":          4,
+    "emit_feedback":       true,
+    "feedback_period_us":  500
+  },
+
+  "ui": {
+    "live_dashboard": true,
+    "refresh_ms":     100,
+    "run_seconds":    3
+  }
+}

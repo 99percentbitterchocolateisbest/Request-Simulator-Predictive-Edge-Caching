@@ -1,20 +1,22 @@
 // main.cpp ─────────────────────────────────────────────────────────────────
 // End-to-end demo. Wires three threads that mirror the architecture:
+// Usage:
+//   ./request_sim                        # uses data/sim_config.json if present
+//   ./request_sim path/to/config.json    # explicit config
+//   ./request_sim trace path/to/file.csv # legacy CLI: trace replay shorthand
 //
-//   producer thread — owned by RequestSimulator (Traffic Engine pushing)
-//   consumer thread — pretends to be the ML Predictor
-//   feedback thread — pretends to be the Edge Cache Controller
-//
-// Run:  ./request_sim                 (synthetic Zipf+Poisson)
-//       ./request_sim trace path.csv  (replay a trace file)
-//
-// We deliberately keep the "ML Predictor" and "Cache Controller" mocks
-// trivial — the point is to exercise every channel in the diagram from
-// the simulator's side: request_stream out, history out, feedback in.
+// Three threads still mirror the architecture:
+//   producer  — owned by RequestSimulator (Traffic Engine pushing)
+//   consumer  — pretends to be the ML Predictor
+//   feedback  — pretends to be the Edge Cache Controller
+// And optionally a fourth: the LiveDashboard renderer.
+
 
 #include "DatasetLoader.hpp"
 #include "RequestSimulator.hpp"
 #include "TrafficEngine.hpp"
+#include "LiveDashboard.hpp"
+#include "SimConfig.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -28,88 +30,135 @@
 using namespace pec;
 using clock_t_ = std::chrono::steady_clock;
 
-int main(int argc, char** argv) {
-    // ── Choose a TrafficEngine based on CLI args ────────────────────
-    std::unique_ptr<TrafficEngine> engine;
+namespace {
+
+SimConfig resolve_config(int argc, char** argv) {
     if (argc >= 3 && std::string(argv[1]) == "trace") {
-        auto loader = std::make_unique<CsvTraceLoader>(argv[2]);
-        engine = std::make_unique<TraceReplayEngine>(std::move(loader));
-        std::cout << "[mode] trace replay: " << argv[2] << "\n";
-    } else {
-        SyntheticConfig sc;
-        sc.catalog_size = 5'000;
-        sc.zipf_alpha   = 0.80;
-        sc.num_users    = 50;
-        sc.mean_iat_ns  = 250'000;        // 4 kreq/s nominal
-        engine = std::make_unique<SyntheticEngine>(sc);
-        std::cout << "[mode] synthetic Zipf(α=0.8) + Poisson\n";
+        SimConfig c;
+        c.mode         = WorkloadMode::Trace;
+        c.trace_path   = argv[2];
+        c.config_label = "cli-trace";
+        return c;
     }
+    std::string path = (argc >= 2) ? argv[1] : "data/sim_config.json";
+    return load_sim_config(path);
+}
 
-    SimulatorConfig sim_cfg;
-    sim_cfg.stream_queue_capacity = 2048;
-    sim_cfg.history_window        = 128;
-    sim_cfg.max_requests          = 50'000;   // bound the demo run
-    sim_cfg.real_time_pacing      = false;    // batch mode
+std::unique_ptr<TrafficEngine> build_engine(const SimConfig& c) {
+    if (c.mode == WorkloadMode::Trace) {
+        auto loader = std::make_unique<CsvTraceLoader>(c.trace_path);
+        return std::make_unique<TraceReplayEngine>(std::move(loader));
+    }
+    return std::make_unique<SyntheticEngine>(c.synthetic);
+}
 
-    RequestSimulator sim(std::move(engine), sim_cfg);
+std::string mode_label(const SimConfig& c) {
+    if (c.mode == WorkloadMode::Trace)
+        return "trace replay: " + c.trace_path;
+    return "synthetic Zipf(a=" +
+           std::to_string(c.synthetic.zipf_alpha).substr(0, 4) +
+           ") + Poisson";
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    SimConfig cfg = resolve_config(argc, argv);
+    print_sim_config(cfg);
+    std::cout << std::endl;
+
+    auto engine = build_engine(cfg);
+    RequestSimulator sim(std::move(engine), cfg.simulator);
     sim.start();
+
+    DashboardStats stats;
 
     // ── Mock ML Predictor consumer ─────────────────────────────────
     std::atomic<bool> stop_consumer{false};
-    std::atomic<std::size_t> consumed{0};
     std::thread predictor([&]{
         std::vector<Request> batch;
         while (!stop_consumer.load()) {
             batch.clear();
-            const auto n = sim.pop_request_stream(batch, 128);
-            if (n == 0) break;  // simulator stopped + queue drained
-            consumed.fetch_add(n);
+            const auto n = sim.pop_request_stream(batch, cfg.consumer.batch_size);
+            if (n == 0) break;
+            stats.consumed.fetch_add(n);
 
-            // Demonstrate the history channel: every 1024 requests the
-            // Feature Extractor would call this exactly once per
-            // prediction step.
-            if (consumed.load() % 1024 < n) {
+            if (stats.consumed.load() % 1024 < n) {
                 auto hist = sim.get_history();
-                (void)hist;  // ML logic would consume this
+                (void)hist;
             }
         }
     });
 
     // ── Mock Edge Cache Controller posting feedback ────────────────
     std::atomic<bool> stop_feedback{false};
-    std::thread cache_ctrl([&]{
-        uint64_t rid = 1;
-        while (!stop_feedback.load()) {
-            // Pretend ~70% hit rate, alternate hit/miss.
-            Feedback fb;
-            fb.request_id = rid;
-            fb.outcome    = (rid % 10 < 7) ? CacheOutcome::HIT
-                                           : CacheOutcome::MISS;
-            fb.served_ns  = 0;
-            sim.submit_feedback(fb);
-            rid += 1;
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
-        }
-    });
+    std::thread cache_ctrl;
+    if (cfg.consumer.emit_feedback) {
+        cache_ctrl = std::thread([&]{
+            uint64_t rid = 1;
+            while (!stop_feedback.load()) {
+                Feedback fb;
+                fb.request_id = rid;
+                fb.outcome    = (rid % 10 < 7) ? CacheOutcome::HIT
+                                               : CacheOutcome::MISS;
+                fb.served_ns  = 0;
+                sim.submit_feedback(fb);
+                stats.feedback_count.fetch_add(1);
+                if (fb.outcome == CacheOutcome::HIT)
+                    stats.feedback_hits.fetch_add(1);
+                rid += 1;
+                std::this_thread::sleep_for(
+                    std::chrono::microseconds(cfg.consumer.feedback_period_us));
+            }
+        });
+    }
 
-    // ── Run for ~2 wall-clock seconds, then shut down ──────────────
+    // ── Optional live dashboard ────────────────────────────────────
+    std::atomic<bool> stop_dashboard{false};
+    std::thread dashboard;
+    std::unique_ptr<LiveDashboard> dash;
+    if (cfg.ui.live_dashboard) {
+        dash = std::make_unique<LiveDashboard>(
+            sim, stats,
+            mode_label(cfg),
+            cfg.config_label,
+            cfg.simulator.stream_queue_capacity,
+            cfg.simulator.history_window,
+            cfg.simulator.max_requests);
+        dashboard = std::thread([&]{
+            dash->run(stop_dashboard,
+                      std::chrono::milliseconds(cfg.ui.refresh_ms));
+        });
+    }
+
+    // ── Run for the configured wall-clock window, then shut down ───
     const auto t0 = clock_t_::now();
-    while (clock_t_::now() - t0 < std::chrono::seconds(2)) {
+    while (clock_t_::now() - t0 < std::chrono::seconds(cfg.ui.run_seconds)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        if (sim.produced() >= sim_cfg.max_requests) break;
+        if (cfg.simulator.max_requests &&
+            sim.produced() >= cfg.simulator.max_requests) break;
     }
 
     sim.stop();
     stop_consumer.store(true);
     stop_feedback.store(true);
     predictor.join();
-    cache_ctrl.join();
+    if (cache_ctrl.joinable()) cache_ctrl.join();
 
-    // ── Report ─────────────────────────────────────────────────────
-    std::cout << "[stats] produced  = " << sim.produced()  << "\n"
-              << "[stats] consumed  = " << consumed.load() << "\n"
-              << "[stats] dropped   = " << sim.dropped()   << "\n"
-              << "[stats] history   = " << sim.get_history().size()
-              << " / " << sim_cfg.history_window << "\n";
+    stop_dashboard.store(true);
+    if (dashboard.joinable()) dashboard.join();
+
+    // ── Final report (always, even with dashboard) ─────────────────
+    std::cout << "\n[final] config    = " << cfg.config_label << "\n"
+              << "[final] produced  = " << sim.produced()  << "\n"
+              << "[final] consumed  = " << stats.consumed.load() << "\n"
+              << "[final] dropped   = " << sim.dropped()   << "\n"
+              << "[final] history   = " << sim.get_history().size()
+              << " / " << cfg.simulator.history_window << "\n";
+    if (stats.feedback_count.load()) {
+        double hr = 100.0 * stats.feedback_hits.load() / stats.feedback_count.load();
+        std::cout << "[final] hit rate  = " << hr << "%\n";
+    }
     return 0;
 }
+
